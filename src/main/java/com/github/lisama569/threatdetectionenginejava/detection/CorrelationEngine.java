@@ -3,6 +3,7 @@ package com.github.lisama569.threatdetectionenginejava.detection;
 import com.github.lisama569.threatdetectionenginejava.model.CorrelationRule;
 import com.github.lisama569.threatdetectionenginejava.model.SecurityEvent;
 import com.github.lisama569.threatdetectionenginejava.model.WindowSnapshot;
+import com.github.lisama569.threatdetectionenginejava.persistence.WindowMemento;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -127,5 +128,40 @@ public class CorrelationEngine {
     public Optional<WindowState> findState(String ruleId, int version, String entityId) {
         Map<String, WindowState> byEntity = windows.get(key(ruleId, version));
         return byEntity == null ? Optional.empty() : Optional.ofNullable(byEntity.get(entityId));
+    }
+
+    /**
+     * 导出全部规则版本、全部实体下尚未驱逐的窗口状态（版本按 {@code ruleId#version} 隔离）。
+     * 调用方应在无摄入并发时进行（停机快照或恢复闸门下）。
+     */
+    public List<WindowMemento> exportWindows() {
+        List<WindowMemento> result = new ArrayList<>();
+        for (ConcurrentMap<String, WindowState> byEntity : windows.values()) {
+            for (WindowState state : byEntity.values()) {
+                result.add(state.toMemento());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 导入窗口状态；要求对应 ruleId#version 的规则槽位已存在（调用方先按版本顺序部署规则）。
+     * 不同规则版本的窗口各自回到自己的槽位，旧版本窗口不会被新版本规则读到，互不串用。
+     *
+     * @throws IllegalStateException 对应规则版本尚未部署
+     */
+    public void importWindows(List<WindowMemento> mementos) {
+        if (mementos == null) {
+            return;
+        }
+        for (WindowMemento m : mementos) {
+            ConcurrentMap<String, WindowState> byEntity = windows.get(key(m.ruleId(), m.ruleVersion()));
+            if (byEntity == null) {
+                throw new IllegalStateException(
+                        "恢复窗口状态时缺少对应规则版本槽位: " + key(m.ruleId(), m.ruleVersion())
+                                + "，应先恢复该版本规则");
+            }
+            byEntity.put(m.entityId(), WindowState.fromMemento(m));
+        }
     }
 }

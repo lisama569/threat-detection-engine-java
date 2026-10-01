@@ -2,6 +2,9 @@ package com.github.lisama569.threatdetectionenginejava.detection;
 
 import com.github.lisama569.threatdetectionenginejava.model.SecurityEvent;
 import com.github.lisama569.threatdetectionenginejava.model.WindowSnapshot;
+import com.github.lisama569.threatdetectionenginejava.persistence.EventRefMemento;
+import com.github.lisama569.threatdetectionenginejava.persistence.FixedWindowMemento;
+import com.github.lisama569.threatdetectionenginejava.persistence.WindowMemento;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -166,6 +169,49 @@ public final class WindowState {
         }
         FixedWindow current = windows.get(windowStart(watermark));
         return current == null ? List.of() : List.copyOf(current.events);
+    }
+
+    /**
+     * 导出持久化备忘录：watermark（迟到判断基准）+ 全部尚未驱逐的窗口
+     * （计数、去重指纹、已告警标记）。已被 {@link #evict} 回收的窗口不导出。
+     */
+    public WindowMemento toMemento() {
+        List<FixedWindowMemento> windowMementos = new ArrayList<>();
+        for (FixedWindow w : windows.values()) {
+            List<EventRefMemento> refs = w.events.stream()
+                    .map(e -> new EventRefMemento(e.eventId(), e.eventTime()))
+                    .toList();
+            windowMementos.add(new FixedWindowMemento(w.start, w.alerted, refs));
+        }
+        long restoredWatermark = watermark == Long.MIN_VALUE ? 0L : watermark;
+        return new WindowMemento(ruleId, ruleVersion, entityId, windowMillis,
+                restoredWatermark, windowMementos);
+    }
+
+    /**
+     * 从持久化备忘录重建窗口状态：watermark、窗口内去重指纹与已告警标记逐项延续，
+     * 因此重启后的迟到判断、内容去重与“同一窗口不重复告警”结论与未重启完全一致。
+     */
+    public static WindowState fromMemento(WindowMemento m) {
+        WindowState state = new WindowState(m.ruleId(), m.ruleVersion(), m.entityId(),
+                m.windowMillis());
+        if (m.windows().isEmpty()) {
+            // 没有存活窗口时 watermark 无判定意义，保持初始值
+            return state;
+        }
+        state.watermark = m.watermark();
+        for (FixedWindowMemento wm : m.windows()) {
+            FixedWindow w = new FixedWindow(wm.start());
+            w.alerted = wm.alerted();
+            for (EventRefMemento ref : wm.events()) {
+                w.eventIds.add(ref.eventId());
+                // 仅判定/调试所需字段（指纹+时间）；source/类型等原始字段不参与窗口判定
+                w.events.add(new SecurityEvent(ref.eventId(), m.ruleId(), m.entityId(),
+                        null, null, ref.eventTime(), 0L, null));
+            }
+            state.windows.put(wm.start(), w);
+        }
+        return state;
     }
 
     private static final class FixedWindow {

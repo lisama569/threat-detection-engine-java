@@ -4,6 +4,8 @@ import com.github.lisama569.threatdetectionenginejava.alert.AlertLifecycleServic
 import com.github.lisama569.threatdetectionenginejava.detection.CorrelationEngine;
 import com.github.lisama569.threatdetectionenginejava.normalization.EventNormalizer;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceRegistry;
+import com.github.lisama569.threatdetectionenginejava.recovery.RecoveryGate;
+import com.github.lisama569.threatdetectionenginejava.recovery.RecoveryProperties;
 import com.github.lisama569.threatdetectionenginejava.service.DetectionService;
 import com.github.lisama569.threatdetectionenginejava.store.InMemoryStore;
 import org.springframework.context.annotation.Bean;
@@ -48,7 +50,12 @@ public class EngineConfig {
     @Bean
     public DetectionService detectionService(InMemoryStore store, SourceRegistry registry,
                                              CorrelationEngine engine, EventNormalizer normalizer,
-                                             AlertLifecycleService lifecycle, Clock clock) {
-        return new DetectionService(store, registry, engine, normalizer, lifecycle, clock);
+                                             AlertLifecycleService lifecycle, Clock clock,
+                                             RecoveryGate recoveryGate,
+                                             RecoveryProperties recoveryProperties) {
+        DetectionService service = new DetectionService(store, registry, engine, normalizer,
+                lifecycle, clock, recoveryGate);
+        service.setAwaitTimeoutMillis(recoveryProperties.getAwaitTimeoutMillis());
+        return service;
     }
 }

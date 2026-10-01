@@ -2,9 +2,12 @@ package com.github.lisama569.threatdetectionenginejava.store;
 
 import com.github.lisama569.threatdetectionenginejava.dedup.DeliveryDeduplicator;
 import com.github.lisama569.threatdetectionenginejava.model.Alert;
+import com.github.lisama569.threatdetectionenginejava.model.AlertStatus;
 import com.github.lisama569.threatdetectionenginejava.model.CorrelationRule;
 import com.github.lisama569.threatdetectionenginejava.model.IngestOutcome;
 import com.github.lisama569.threatdetectionenginejava.model.RejectReason;
+import com.github.lisama569.threatdetectionenginejava.persistence.AlertMemento;
+import com.github.lisama569.threatdetectionenginejava.persistence.StatsMemento;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -134,9 +137,81 @@ public class InMemoryStore {
         return result;
     }
 
+    // ---- 重启续跑：状态导出与恢复 ----
+
+    /** 投递去重键快照（重启后据此重建幂等判定，重复投递不会二次计数）。 */
+    public java.util.Set<String> exportDedupKeys() {
+        return deduplicator.snapshotKeys();
+    }
+
+    public void restoreDedupKeys(java.util.Set<String> keys) {
+        if (keys != null) {
+            keys.forEach(deduplicator::markIfFirst);
+        }
+    }
+
+    /** 全部历史规则版本（按 ruleId -> version 存回，版本史不丢）。 */
+    public List<CorrelationRule> exportRules() {
+        List<CorrelationRule> all = new ArrayList<>();
+        for (TreeMap<Integer, CorrelationRule> versions : ruleHistory.values()) {
+            all.addAll(versions.values());
+        }
+        return all;
+    }
+
+    public void restoreRule(CorrelationRule rule) {
+        saveRule(rule);
+    }
+
+    public List<AlertMemento> exportAlerts() {
+        List<AlertMemento> result = new ArrayList<>();
+        for (Alert a : alerts.values()) {
+            result.add(new AlertMemento(a.getAlertId(), a.getRuleId(), a.getRuleVersion(),
+                    a.getEntityId(), a.getCreatedAt(), a.getTriggerEventTime(),
+                    a.getTriggerCount(), a.getStatus().name(), a.getStatusUpdatedAt(),
+                    a.getResolutionNote()));
+        }
+        return result;
+    }
+
+    public void restoreAlert(AlertMemento m) {
+        Alert alert = new Alert(m.alertId(), m.ruleId(), m.ruleVersion(), m.entityId(),
+                m.createdAt(), m.triggerEventTime(), m.triggerCount(),
+                AlertStatus.valueOf(m.status()), m.statusUpdatedAt(), m.resolutionNote());
+        alerts.put(alert.getAlertId(), alert);
+    }
+
+    public StatsMemento exportStats() {
+        return new StatsMemento(total.get(), rejected.get(), duplicate.get(), tooLate.get(),
+                acceptedNoAlert.get(), acceptedAlert.get(), rejectionBreakdown());
+    }
+
+    /** 恢复守恒统计与拒绝原因分布（重启后累计数延续，不是从 0 重新开始）。 */
+    public void restoreStats(StatsMemento m) {
+        total.set(m.total());
+        rejected.set(m.rejected());
+        duplicate.set(m.duplicate());
+        tooLate.set(m.tooLate());
+        acceptedNoAlert.set(m.acceptedNoAlert());
+        acceptedAlert.set(m.acceptedAlert());
+        rejectionBreakdown.clear();
+        m.rejectionBreakdown().forEach((name, count) ->
+                rejectionBreakdown.put(RejectReason.valueOf(name), new AtomicLong(count)));
+    }
+
     /** 对同一实体的判定串行化（分段锁，避免全局锁瓶颈）。 */
     public Lock entityLock(String entityId) {
         int index = Math.floorMod(entityId.hashCode(), LOCK_STRIPES);
         return entityLocks[index];
+    }
+
+    /** 按编号取分段锁（快照时一次性锁全部 64 段，得到无摄入写在途的一致瞬间）。 */
+    public Lock entityLockByStripe(int stripe) {
+        return entityLocks[stripe];
+    }
+
+    /** 分段锁数量。 */
+    public int lockStripeCount() {
+        return LOCK_STRIPES;
     }
 }

@@ -25,11 +25,21 @@ public class CorrelationRuleBootstrap {
     @Order(0)
     public CommandLineRunner seedData(DetectionService service) {
         return args -> {
+            int sourcesAdded = 0;
             for (SourceDescriptor source : defaultSources()) {
+                if (service.getRegistry().isRegistered(source.sourceId())) {
+                    continue;
+                }
                 service.registerSource(source);
+                sourcesAdded++;
             }
-            service.deployRule(bruteForceRuleV1());
-            log.info("默认来源 {} 个、初始规则 1 个已装载", defaultSources().size());
+            boolean rulePresent = service.getEngine().getRule(bruteForceRuleV1().ruleId()).isPresent();
+            if (!rulePresent) {
+                service.deployRule(bruteForceRuleV1());
+            }
+            log.info("默认引导完成: 新增来源 {} 个、初始规则 {}，恢复状态={}",
+                    sourcesAdded, rulePresent ? "已存在(随快照恢复)" : "已部署 v1",
+                    service.recoveryStatus());
         };
     }
 

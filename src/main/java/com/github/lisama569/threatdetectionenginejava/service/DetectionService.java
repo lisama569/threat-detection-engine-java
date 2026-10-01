@@ -15,6 +15,8 @@ import com.github.lisama569.threatdetectionenginejava.normalization.EventNormali
 import com.github.lisama569.threatdetectionenginejava.normalization.NormalizationException;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceDescriptor;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceRegistry;
+import com.github.lisama569.threatdetectionenginejava.persistence.StateMemento;
+import com.github.lisama569.threatdetectionenginejava.recovery.RecoveryGate;
 import com.github.lisama569.threatdetectionenginejava.store.IngestStats;
 import com.github.lisama569.threatdetectionenginejava.store.InMemoryStore;
 import org.slf4j.Logger;
@@ -48,15 +50,30 @@ public class DetectionService {
     private final EventNormalizer normalizer;
     private final AlertLifecycleService lifecycle;
     private final Clock clock;
+    /** 恢复边界闸门；为 null（隔离重放/历史单测）时不做恢复阶段限制，等价于始终可写。 */
+    private final RecoveryGate gate;
+    /** 恢复期间写请求最长阻塞等待；由装配层设置，默认 10s。 */
+    private long awaitTimeoutMillis = 10_000L;
 
     public DetectionService(InMemoryStore store, SourceRegistry registry, CorrelationEngine engine,
                             EventNormalizer normalizer, AlertLifecycleService lifecycle, Clock clock) {
+        this(store, registry, engine, normalizer, lifecycle, clock, null);
+    }
+
+    public DetectionService(InMemoryStore store, SourceRegistry registry, CorrelationEngine engine,
+                            EventNormalizer normalizer, AlertLifecycleService lifecycle, Clock clock,
+                            RecoveryGate gate) {
         this.store = store;
         this.registry = registry;
         this.engine = engine;
         this.normalizer = normalizer;
         this.lifecycle = lifecycle;
         this.clock = clock;
+        this.gate = gate;
+    }
+
+    public void setAwaitTimeoutMillis(long awaitTimeoutMillis) {
+        this.awaitTimeoutMillis = awaitTimeoutMillis;
     }
 
     public InMemoryStore getStore() { return store; }
@@ -73,18 +90,27 @@ public class DetectionService {
         store.saveRule(rule);
     }
 
-    /** 摄入单条原始事件（线程安全、幂等）。 */
+    /** 摄入单条原始事件（线程安全、幂等）。恢复期间阻塞等待恢复结束，恢复失败则拒绝。 */
     public IngestResult ingest(RawEvent raw) {
+        awaitWritable();
         return doIngest(raw, engine, store, true);
     }
 
     /** 批量摄入：逐条处理并加锁，保持顺序可解释。 */
     public List<IngestResult> ingestBatch(List<RawEvent> raws) {
+        awaitWritable();
         List<IngestResult> results = new ArrayList<>();
         for (RawEvent raw : raws) {
             results.add(ingest(raw));
         }
         return results;
+    }
+
+    /** 恢复边界：恢复没完成不能把请求当空实例处理；恢复失败显式拒绝（由上层映射 503）。 */
+    private void awaitWritable() {
+        if (gate != null) {
+            gate.awaitWritable(awaitTimeoutMillis);
+        }
     }
 
     /**
@@ -225,6 +251,7 @@ public class DetectionService {
     }
 
     public Alert transitionAlert(String alertId, AlertStatus to, String note) {
+        awaitWritable();
         Alert alert = store.findAlert(alertId)
                 .orElseThrow(() -> new IllegalArgumentException("告警不存在: " + alertId));
         synchronized (alert) {
@@ -246,5 +273,31 @@ public class DetectionService {
 
     public Map<String, Long> rejectionBreakdown() {
         return store.rejectionBreakdown();
+    }
+
+    /** 恢复状态视图（无闸门的隔离实例返回 null）。 */
+    public com.github.lisama569.threatdetectionenginejava.recovery.RecoveryStatus recoveryStatus() {
+        return gate == null ? null : gate.status();
+    }
+
+    /**
+     * 在停机/快照时刻捕获一致状态备忘录。调用方（checkpoint 编排）须已确认实例处于 ACTIVE，
+     * 且此处对全部实体分段锁加锁，保证捕获窗口/去重/告警/统计的瞬间没有摄入写在中途。
+     */
+    public StateMemento captureState(
+            com.github.lisama569.threatdetectionenginejava.recovery.StateSnapshotService snapshots) {
+        List<Lock> locks = new ArrayList<>();
+        try {
+            for (int i = 0; i < store.lockStripeCount(); i++) {
+                Lock l = store.entityLockByStripe(i);
+                l.lock();
+                locks.add(l);
+            }
+            return snapshots.capture(store, engine, registry);
+        } finally {
+            for (Lock l : locks) {
+                l.unlock();
+            }
+        }
     }
 }
