@@ -134,6 +134,56 @@ public class InMemoryStore {
         return result;
     }
 
+    // ---- 重启恢复 / 快照导出（只在启动恢复、停机快照时调用，恢复期间不对外摄入） ----
+
+    /** 恢复一条规则版本（不做单调递增校验，快照内版本可能乱序）。 */
+    public void restoreRule(CorrelationRule rule) {
+        ruleHistory.computeIfAbsent(rule.ruleId(), k -> new TreeMap<>())
+                .put(rule.version(), rule);
+    }
+
+    public List<CorrelationRule> allRules() {
+        List<CorrelationRule> all = new ArrayList<>();
+        for (TreeMap<Integer, CorrelationRule> versions : ruleHistory.values()) {
+            all.addAll(versions.values());
+        }
+        return all;
+    }
+
+    /** 恢复一条告警（含当前处置状态），按确定性 ID 幂等覆盖。 */
+    public void restoreAlert(Alert alert) {
+        alerts.put(alert.getAlertId(), alert);
+    }
+
+    /** 恢复投递去重键集合：重启后历史投递仍被识别为重复。 */
+    public void restoreDedupKeys(java.util.Set<String> keys) {
+        if (keys != null) {
+            deduplicator.restoreKeys(keys);
+        }
+    }
+
+    /** 恢复守恒计数器，保证重启后统计与“从未重启”完全一致。 */
+    public void restoreStats(IngestStats snapshot) {
+        total.set(snapshot.total());
+        rejected.set(snapshot.rejected());
+        duplicate.set(snapshot.duplicate());
+        tooLate.set(snapshot.tooLate());
+        acceptedNoAlert.set(snapshot.acceptedNoAlert());
+        acceptedAlert.set(snapshot.acceptedAlert());
+    }
+
+    /** 恢复拒绝原因分布。 */
+    public void restoreRejectionBreakdown(Map<RejectReason, Long> breakdown) {
+        if (breakdown != null) {
+            breakdown.forEach((reason, count) ->
+                    rejectionBreakdown.computeIfAbsent(reason, r -> new AtomicLong()).set(count));
+        }
+    }
+
+    public int alertCount() {
+        return alerts.size();
+    }
+
     /** 对同一实体的判定串行化（分段锁，避免全局锁瓶颈）。 */
     public Lock entityLock(String entityId) {
         int index = Math.floorMod(entityId.hashCode(), LOCK_STRIPES);

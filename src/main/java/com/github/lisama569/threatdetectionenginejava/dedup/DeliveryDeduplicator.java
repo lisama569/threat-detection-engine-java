@@ -36,4 +36,15 @@ public class DeliveryDeduplicator {
     public Set<String> snapshotKeys() {
         return Collections.unmodifiableSet(Set.copyOf(seen));
     }
+
+    /** 重启恢复：把历史去重键补录进来（与构造器注入等价，供内存态恢复使用）。 */
+    public void restoreKeys(Set<String> keys) {
+        if (keys != null) {
+            seen.addAll(keys);
+        }
+    }
+
+    public int size() {
+        return seen.size();
+    }
 }

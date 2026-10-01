@@ -9,12 +9,16 @@ import com.github.lisama569.threatdetectionenginejava.model.WindowSnapshot;
 import com.github.lisama569.threatdetectionenginejava.normalization.EventNormalizer;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceDescriptor;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceRegistry;
+import com.github.lisama569.threatdetectionenginejava.persistence.LocalStateStore;
+import com.github.lisama569.threatdetectionenginejava.persistence.StateCodec;
+import com.github.lisama569.threatdetectionenginejava.persistence.StateRecoveryCoordinator;
 import com.github.lisama569.threatdetectionenginejava.service.DetectionService;
 import com.github.lisama569.threatdetectionenginejava.store.IngestStats;
 import com.github.lisama569.threatdetectionenginejava.store.InMemoryStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -174,6 +178,92 @@ public final class EngineTestFixtures {
         @Override
         public Instant instant() {
             return Instant.ofEpochMilli(millis);
+        }
+    }
+
+    /**
+     * 一个可“停机→重启”的本地实例：同一 stateDir、同一时钟，重新装配一套 service/coordinator，
+     * 用来验证重启续跑（不依赖 Spring 容器）。
+     */
+    public static final class RestartableHarness {
+        public final Path stateDir;
+        public final MutableClock clock;
+        public final SourceRegistry registry;
+        public DetectionService service;
+        public StateRecoveryCoordinator recovery;
+        public long restartCount = 0;
+
+        public RestartableHarness(Path stateDir, MutableClock clock) {
+            this.stateDir = stateDir;
+            this.clock = clock;
+            this.registry = defaultRegistry();
+            boot(true);
+        }
+
+        /** 构造一套处于 RECOVERING、尚未执行恢复的实例（用于恢复边界测试手动控制 initialize）。 */
+        public static RestartableHarness uninitialized(Path stateDir, MutableClock clock) {
+            return new RestartableHarness(stateDir, clock, false, false);
+        }
+
+        /** 构造一套处于 RECOVERING、尚未恢复、且“损坏时允许丢弃”的实例。 */
+        public static RestartableHarness uninitializedAllowingFresh(Path stateDir, MutableClock clock) {
+            return new RestartableHarness(stateDir, clock, false, true);
+        }
+
+        private RestartableHarness(Path stateDir, MutableClock clock, boolean autoInitialize) {
+            this(stateDir, clock, autoInitialize, false);
+        }
+
+        private RestartableHarness(Path stateDir, MutableClock clock, boolean autoInitialize,
+                                   boolean allowFreshOnCorrupt) {
+            this.stateDir = stateDir;
+            this.clock = clock;
+            this.registry = defaultRegistry();
+            boot(autoInitialize, allowFreshOnCorrupt);
+        }
+
+        /** 装配一套新组件并执行恢复（默认初始规则 v1 由调用方按需部署）。 */
+        public void boot(boolean initialize) {
+            boot(initialize, false);
+        }
+
+        public void boot(boolean initialize, boolean allowFreshOnCorrupt) {
+            InMemoryStore store = new InMemoryStore();
+            CorrelationEngine engine = new CorrelationEngine();
+            EventNormalizer normalizer = new EventNormalizer(registry, clock);
+            AlertLifecycleService lifecycle = new AlertLifecycleService(clock);
+            this.service = new DetectionService(store, registry, engine, normalizer, lifecycle, clock);
+            this.recovery = new StateRecoveryCoordinator(service,
+                    new LocalStateStore(stateDir), new StateCodec(), clock, allowFreshOnCorrupt);
+            if (initialize) {
+                this.recovery.initialize();
+            }
+            restartCount++;
+        }
+
+        /** 全新启动后部署初始规则（仅当恢复结果里没有任何规则时）。 */
+        public void seedRuleIfFresh(CorrelationRule rule) {
+            if (recovery.report() == null || recovery.report().restoredRules() == 0) {
+                service.deployRule(rule);
+            }
+        }
+
+        /** 优雅停机：落盘。 */
+        public void stop() {
+            recovery.shutdown();
+        }
+
+        /** 停机后用同一本地状态重新启动；返回恢复结论。 */
+        public com.github.lisama569.threatdetectionenginejava.persistence.RecoveryReport restart() {
+            stop();
+            boot(true);
+            return recovery.report();
+        }
+
+        public com.github.lisama569.threatdetectionenginejava.persistence.RecoveryReport restart(boolean allowFreshOnCorrupt) {
+            stop();
+            boot(true, allowFreshOnCorrupt);
+            return recovery.report();
         }
     }
 }

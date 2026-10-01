@@ -3,18 +3,23 @@ package com.github.lisama569.threatdetectionenginejava.service;
 import com.github.lisama569.threatdetectionenginejava.alert.AlertLifecycleService;
 import com.github.lisama569.threatdetectionenginejava.detection.CorrelationEngine;
 import com.github.lisama569.threatdetectionenginejava.detection.Evaluation;
+import com.github.lisama569.threatdetectionenginejava.detection.WindowState;
 import com.github.lisama569.threatdetectionenginejava.model.Alert;
 import com.github.lisama569.threatdetectionenginejava.model.AlertStatus;
 import com.github.lisama569.threatdetectionenginejava.model.CorrelationRule;
 import com.github.lisama569.threatdetectionenginejava.model.IngestOutcome;
 import com.github.lisama569.threatdetectionenginejava.model.IngestResult;
 import com.github.lisama569.threatdetectionenginejava.model.RawEvent;
+import com.github.lisama569.threatdetectionenginejava.model.RejectReason;
 import com.github.lisama569.threatdetectionenginejava.model.SecurityEvent;
 import com.github.lisama569.threatdetectionenginejava.model.WindowSnapshot;
 import com.github.lisama569.threatdetectionenginejava.normalization.EventNormalizer;
 import com.github.lisama569.threatdetectionenginejava.normalization.NormalizationException;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceDescriptor;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceRegistry;
+import com.github.lisama569.threatdetectionenginejava.persistence.RecoveryFailedException;
+import com.github.lisama569.threatdetectionenginejava.persistence.RecoveryInProgressException;
+import com.github.lisama569.threatdetectionenginejava.persistence.RecoveryPhase;
 import com.github.lisama569.threatdetectionenginejava.store.IngestStats;
 import com.github.lisama569.threatdetectionenginejava.store.InMemoryStore;
 import org.slf4j.Logger;
@@ -22,8 +27,10 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.locks.Lock;
 
 /**
@@ -49,6 +56,12 @@ public class DetectionService {
     private final AlertLifecycleService lifecycle;
     private final Clock clock;
 
+    /**
+     * 恢复边界：直接 new 出来（单测/隔离重放）默认 {@link RecoveryPhase#ACTIVE}；
+     * Spring 装配、走重启续跑时由 StateRecoveryCoordinator 在构造后置为 RECOVERING。
+     */
+    private volatile RecoveryPhase phase = RecoveryPhase.ACTIVE;
+
     public DetectionService(InMemoryStore store, SourceRegistry registry, CorrelationEngine engine,
                             EventNormalizer normalizer, AlertLifecycleService lifecycle, Clock clock) {
         this.store = store;
@@ -57,6 +70,40 @@ public class DetectionService {
         this.normalizer = normalizer;
         this.lifecycle = lifecycle;
         this.clock = clock;
+    }
+
+    public RecoveryPhase getPhase() {
+        return phase;
+    }
+
+    /** 标记进入“恢复中”：此后一切写入请求被拒绝，直到 {@link #markActive()}。 */
+    public void markRecovering() {
+        this.phase = RecoveryPhase.RECOVERING;
+        log.info("服务进入 RECOVERING：恢复完成前拒绝一切摄入/状态迁移请求");
+    }
+
+    /** 恢复成功或确认无状态全新启动后放行。 */
+    public void markActive() {
+        this.phase = RecoveryPhase.ACTIVE;
+        log.info("服务进入 ACTIVE：恢复完成，开始正常对外服务");
+    }
+
+    /** 状态损坏且未允许丢弃：永久拒绝写入，只能由运维介入，绝不静默按空实例服务。 */
+    public void markFailed() {
+        this.phase = RecoveryPhase.FAILED;
+        log.error("服务进入 FAILED：本地状态恢复失败，拒绝一切写入请求");
+    }
+
+    /** 写入路径统一门禁：恢复中 503、恢复失败拒绝。读路径（stats/alerts/windows）不受限。 */
+    private void ensureWritable() {
+        if (phase == RecoveryPhase.RECOVERING) {
+            throw new RecoveryInProgressException(
+                    "本地状态正在恢复中，请稍后重试；该请求未被计入，恢复后也不会被重复处理");
+        }
+        if (phase == RecoveryPhase.FAILED) {
+            throw new RecoveryFailedException(
+                    "本地状态恢复失败，实例已拒绝服务；请修复状态文件或显式允许丢弃后重启");
+        }
     }
 
     public InMemoryStore getStore() { return store; }
@@ -69,17 +116,20 @@ public class DetectionService {
 
     /** 部署规则：同时写入在线引擎与历史版本存储。 */
     public void deployRule(CorrelationRule rule) {
+        ensureWritable();
         engine.deployRule(rule);
         store.saveRule(rule);
     }
 
     /** 摄入单条原始事件（线程安全、幂等）。 */
     public IngestResult ingest(RawEvent raw) {
+        ensureWritable();
         return doIngest(raw, engine, store, true);
     }
 
     /** 批量摄入：逐条处理并加锁，保持顺序可解释。 */
     public List<IngestResult> ingestBatch(List<RawEvent> raws) {
+        ensureWritable();
         List<IngestResult> results = new ArrayList<>();
         for (RawEvent raw : raws) {
             results.add(ingest(raw));
@@ -225,11 +275,88 @@ public class DetectionService {
     }
 
     public Alert transitionAlert(String alertId, AlertStatus to, String note) {
+        ensureWritable();
         Alert alert = store.findAlert(alertId)
                 .orElseThrow(() -> new IllegalArgumentException("告警不存在: " + alertId));
         synchronized (alert) {
             return lifecycle.transition(alert, to, note);
         }
+    }
+
+    // ---- 重启恢复（内部使用：仅 StateRecoveryCoordinator 在 RECOVERING 阶段调用） ----
+
+    /** 恢复全部规则版本（引擎按版本隔离 + 历史版本存储），不走在线部署校验。 */
+    public void restoreRules(List<CorrelationRule> rules) {
+        for (CorrelationRule rule : rules) {
+            engine.restoreRule(rule);
+            store.restoreRule(rule);
+        }
+    }
+
+    /** 恢复告警（含处置状态）。 */
+    public void restoreAlerts(List<Alert> alerts) {
+        for (Alert alert : alerts) {
+            store.restoreAlert(alert);
+        }
+    }
+
+    /** 恢复投递去重键。 */
+    public void restoreDedupKeys(Set<String> keys) {
+        store.restoreDedupKeys(keys);
+    }
+
+    /** 恢复守恒计数与拒绝原因分布。 */
+    public void restoreStats(IngestStats snapshot, Map<RejectReason, Long> rejectionBreakdown) {
+        store.restoreStats(snapshot);
+        store.restoreRejectionBreakdown(rejectionBreakdown);
+    }
+
+    /**
+     * 恢复某个规则版本下所有实体的窗口态（计数/去重指纹/watermark 全部延续）。
+     * 调用前应已通过 {@link #restoreRules} 恢复对应规则版本。
+     */
+    public void restoreWindowStates(String ruleId, int version, List<WindowState> states) {
+        engine.restoreStates(ruleId, version, states);
+    }
+
+    /** 全部历史规则版本（快照用）。 */
+    public List<CorrelationRule> allRules() {
+        return store.allRules();
+    }
+
+    /** 全部告警（快照用）。 */
+    public List<Alert> allAlerts() {
+        return store.listAlerts();
+    }
+
+    /** 投递去重键快照。 */
+    public Set<String> dedupKeySnapshot() {
+        return new HashSet<>(store.deduplicator().snapshotKeys());
+    }
+
+    /**
+     * 以参考时间（默认停机时刻）安全回收全部历史版本里不可能再影响判定的固定窗口。
+     *
+     * @return 被回收的窗口数
+     */
+    public int compactHistory(long referenceTime) {
+        return engine.compact(referenceTime);
+    }
+
+    /** 遍历所有（规则版本, 实体）窗口态（快照用）。 */
+    public List<WindowState> allWindowStates() {
+        List<WindowState> all = new ArrayList<>();
+        for (CorrelationRule rule : store.allRules()) {
+            engine.statesOfVersion(rule.ruleId(), rule.version())
+                    .ifPresent(byEntity -> all.addAll(byEntity.values()));
+        }
+        return all;
+    }
+
+    /** 测试辅助：查询某规则版本某实体的窗口态。 */
+    public java.util.Optional<WindowState> findWindowStateForTest(String ruleId, int version,
+                                                                  String entityId) {
+        return engine.findState(ruleId, version, entityId);
     }
 
     public List<Alert> listAlerts() {

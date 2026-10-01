@@ -27,6 +27,8 @@ public class CorrelationEngine {
 
     /** ruleId -> 最新规则 */
     private final ConcurrentMap<String, CorrelationRule> latestRules = new ConcurrentHashMap<>();
+    /** ruleId#version -> 规则（含历史版本，供版本隔离的窗口回收使用） */
+    private final ConcurrentMap<String, CorrelationRule> rulesByVersion = new ConcurrentHashMap<>();
     /** ruleId#version -> (entityId -> WindowState) */
     private final ConcurrentMap<String, ConcurrentMap<String, WindowState>> windows =
             new ConcurrentHashMap<>();
@@ -46,6 +48,19 @@ public class CorrelationEngine {
                             + ", 已部署=" + existing.version() + ", 提交=" + rule.version());
         }
         latestRules.put(rule.ruleId(), rule);
+        rulesByVersion.put(key(rule.ruleId(), rule.version()), rule);
+        windows.putIfAbsent(key(rule.ruleId(), rule.version()), new ConcurrentHashMap<>());
+    }
+
+    /**
+     * 从本地状态恢复规则（含历史版本）：不做单调递增校验（快照里的版本顺序可能任意），
+     * 但 {@code latestRules} 只取最高版本，保证恢复后新事件仍按最新版本判定。
+     */
+    public void restoreRule(CorrelationRule rule) {
+        validate(rule);
+        rulesByVersion.put(key(rule.ruleId(), rule.version()), rule);
+        latestRules.merge(rule.ruleId(), rule,
+                (a, b) -> a.version() >= b.version() ? a : b);
         windows.putIfAbsent(key(rule.ruleId(), rule.version()), new ConcurrentHashMap<>());
     }
 
@@ -127,5 +142,48 @@ public class CorrelationEngine {
     public Optional<WindowState> findState(String ruleId, int version, String entityId) {
         Map<String, WindowState> byEntity = windows.get(key(ruleId, version));
         return byEntity == null ? Optional.empty() : Optional.ofNullable(byEntity.get(entityId));
+    }
+
+    /** 某规则版本下全部实体的窗口态（恢复时使用）。 */
+    public Optional<ConcurrentMap<String, WindowState>> statesOfVersion(String ruleId, int version) {
+        return Optional.ofNullable(windows.get(key(ruleId, version)));
+    }
+
+    /**
+     * 从本地状态恢复某个规则版本下所有实体的窗口态（计数/去重指纹/watermark 延续）。
+     * 规则版本之间的窗口严格隔离，恢复 v1 不会影响 v2。
+     */
+    public void restoreStates(String ruleId, int version, List<WindowState> states) {
+        String k = key(ruleId, version);
+        ConcurrentMap<String, WindowState> byEntity =
+                windows.computeIfAbsent(k, ignored -> new ConcurrentHashMap<>());
+        for (WindowState state : states) {
+            if (state.getRuleVersion() != version || !state.getRuleId().equals(ruleId)) {
+                throw new IllegalStateException(
+                        "恢复的窗口态与规则版本不匹配: key=" + k + ", state="
+                                + state.getRuleId() + "#v" + state.getRuleVersion());
+            }
+            byEntity.put(state.getEntityId(), state);
+        }
+    }
+
+    /**
+     * 以参考时间对全部（规则版本, 实体）窗口态做安全回收，覆盖所有历史版本。
+     *
+     * @return 被回收的固定窗口总数
+     */
+    public int compact(long referenceTime) {
+        int removed = 0;
+        for (Map.Entry<String, CorrelationRule> entry : rulesByVersion.entrySet()) {
+            CorrelationRule rule = entry.getValue();
+            ConcurrentMap<String, WindowState> byEntity = windows.get(entry.getKey());
+            if (byEntity == null) {
+                continue;
+            }
+            for (WindowState state : byEntity.values()) {
+                removed += state.compactUpTo(referenceTime, rule.lateToleranceMillis());
+            }
+        }
+        return removed;
     }
 }

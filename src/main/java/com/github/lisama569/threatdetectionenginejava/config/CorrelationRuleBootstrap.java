@@ -2,6 +2,8 @@ package com.github.lisama569.threatdetectionenginejava.config;
 
 import com.github.lisama569.threatdetectionenginejava.model.CorrelationRule;
 import com.github.lisama569.threatdetectionenginejava.normalization.SourceDescriptor;
+import com.github.lisama569.threatdetectionenginejava.persistence.RecoveryReport;
+import com.github.lisama569.threatdetectionenginejava.persistence.StateRecoveryCoordinator;
 import com.github.lisama569.threatdetectionenginejava.service.DetectionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,7 +14,12 @@ import org.springframework.core.annotation.Order;
 
 import java.util.List;
 
-/** 启动时注册默认来源与初始规则（本地内存模拟）。 */
+/**
+ * 启动时注册默认来源与初始规则（本地内存模拟）。
+ *
+ * <p>运行在 {@link StateRecoveryCoordinator} 恢复完成之后：来源注册幂等可重复；
+ * 初始规则仅在“全新/禁用恢复（无历史规则）”时部署，已恢复的规则版本以快照为准，不被覆盖。</p>
+ */
 @Configuration
 public class CorrelationRuleBootstrap {
 
@@ -23,13 +30,21 @@ public class CorrelationRuleBootstrap {
 
     @Bean
     @Order(0)
-    public CommandLineRunner seedData(DetectionService service) {
+    public CommandLineRunner seedData(DetectionService service, StateRecoveryCoordinator recovery) {
         return args -> {
             for (SourceDescriptor source : defaultSources()) {
                 service.registerSource(source);
             }
-            service.deployRule(bruteForceRuleV1());
-            log.info("默认来源 {} 个、初始规则 1 个已装载", defaultSources().size());
+            RecoveryReport report = recovery.report();
+            boolean restored = report != null && report.restoredRules() > 0;
+            if (restored) {
+                log.info("检测到已恢复 {} 个规则版本，跳过初始规则部署，规则以本地状态为准",
+                        report.restoredRules());
+            } else {
+                service.deployRule(bruteForceRuleV1());
+                log.info("默认来源 {} 个、初始规则 1 个已装载（恢复状态={}）",
+                        defaultSources().size(), report == null ? "UNKNOWN" : report.status());
+            }
         };
     }
 

@@ -50,6 +50,50 @@ public final class WindowState {
         this.windowMillis = windowMillis;
     }
 
+    /** 持久化用的单个固定窗口数据：只需要去重指纹集合与是否已告警（事件明细不影响判定）。 */
+    public record PersistedWindow(long windowStart, List<String> eventIds, boolean alerted) {
+        public PersistedWindow {
+            eventIds = eventIds == null ? List.of() : List.copyOf(eventIds);
+        }
+    }
+
+    /**
+     * 从本地状态恢复一个窗口态：watermark（迟到判断基准）、窗口内去重指纹与已告警标记全部延续。
+     *
+     * @param watermark 已见最大事件时间；&lt;=0 视为从未见过事件
+     */
+    public static WindowState restore(String ruleId, int ruleVersion, String entityId,
+                                      long windowMillis, long watermark,
+                                      List<PersistedWindow> persisted) {
+        WindowState state = new WindowState(ruleId, ruleVersion, entityId, windowMillis);
+        if (watermark > 0) {
+            state.watermark = watermark;
+        }
+        if (persisted != null) {
+            for (PersistedWindow pw : persisted) {
+                FixedWindow fw = new FixedWindow(pw.windowStart());
+                fw.eventIds.addAll(pw.eventIds());
+                fw.alerted = pw.alerted();
+                state.windows.put(pw.windowStart(), fw);
+            }
+        }
+        return state;
+    }
+
+    /** 导出当前仍存活（未被驱逐/回收）的固定窗口。 */
+    public List<PersistedWindow> exportWindows() {
+        List<PersistedWindow> result = new ArrayList<>();
+        for (FixedWindow w : windows.values()) {
+            result.add(new PersistedWindow(w.start, List.copyOf(w.eventIds), w.alerted));
+        }
+        return result;
+    }
+
+    /** 原始 watermark（未见过事件时为 {@link Long#MIN_VALUE}），供持久化使用。 */
+    public long rawWatermark() {
+        return watermark;
+    }
+
     public String getRuleId() { return ruleId; }
     public int getRuleVersion() { return ruleVersion; }
     public String getEntityId() { return entityId; }
@@ -132,12 +176,28 @@ public final class WindowState {
         windows.entrySet().removeIf(e -> e.getKey() + windowMillis <= boundary);
     }
 
+    /**
+     * 以外部参考时间（如停机时刻，&gt;= 本实体 watermark）做一次安全回收：
+     * 保留下来的只有“在参考时间之后仍可能收到可接受事件”的窗口——即
+     * windowEnd &gt; referenceTime - lateTolerance 的窗口；更早窗口里的任何未来事件都必然
+     * 超过迟到容忍（或窗口已关闭且不可能再计数），回收它们不改变任何后续判定结论。
+     *
+     * @return 被回收的固定窗口数
+     */
+    public int compactUpTo(long referenceTime, long lateTolerance) {
+        long before = windows.size();
+        long boundary = referenceTime - lateTolerance;
+        windows.entrySet().removeIf(e -> e.getKey() + windowMillis <= boundary);
+        return (int) (before - windows.size());
+    }
+
     private long windowStart(long eventTime) {
         return Math.floorDiv(eventTime, windowMillis) * windowMillis;
     }
 
     private WindowSnapshot snapshot(FixedWindow w) {
-        List<String> ids = w.events.stream().map(SecurityEvent::eventId).toList();
+        // eventIds 直接取去重指纹集合：在线态与从状态恢复（无事件明细）后展示一致
+        List<String> ids = List.copyOf(w.eventIds);
         return new WindowSnapshot(ruleId, ruleVersion, entityId, w.start, w.start + windowMillis,
                 w.eventIds.size(), ids, getWatermark(), w.alerted);
     }
