@@ -177,16 +177,30 @@ public final class WindowState {
     }
 
     /**
-     * 以外部参考时间（如停机时刻，&gt;= 本实体 watermark）做一次安全回收：
-     * 保留下来的只有“在参考时间之后仍可能收到可接受事件”的窗口——即
-     * windowEnd &gt; referenceTime - lateTolerance 的窗口；更早窗口里的任何未来事件都必然
-     * 超过迟到容忍（或窗口已关闭且不可能再计数），回收它们不改变任何后续判定结论。
+     * 以外部参考时间（如停机时刻）做一次安全回收。
+     *
+     * <p><b>回收基准只能是本实体自己的 watermark，不能是墙钟。</b>迟到判定只看
+     * {@code watermark - eventTime}，与墙钟无关：一个窗口今后是否还可能收到“容忍内”事件，
+     * 只取决于 watermark。停机前若长时间空闲（墙钟远超最后事件时间），直接拿墙钟回收会把
+     * {@code windowEnd > watermark - lateTolerance}、本还能继续累计的存活窗口一起带走，
+     * 重启后计数/已告警状态就丢了。因此这里把参考时间截到
+     * {@code min(referenceTime, watermark)}：</p>
+     * <ul>
+     *   <li>连续摄入时（参考时间 ≈ watermark）与在线 {@link #evict} 完全等价，
+     *       只回收 {@code windowEnd <= watermark - lateTolerance} 的窗口；
+     *       其中任何未来事件都必然判 TOO_LATE，回收不改变任何后续判定结论。</li>
+     *   <li>停机前空闲时（墙钟 &gt; watermark）不会多收任何窗口，容忍内窗口跨重启照常延续。</li>
+     * </ul>
      *
      * @return 被回收的固定窗口数
      */
     public int compactUpTo(long referenceTime, long lateTolerance) {
+        if (watermark == Long.MIN_VALUE) {
+            return 0;
+        }
+        long safeReference = Math.min(referenceTime, watermark);
         long before = windows.size();
-        long boundary = referenceTime - lateTolerance;
+        long boundary = safeReference - lateTolerance;
         windows.entrySet().removeIf(e -> e.getKey() + windowMillis <= boundary);
         return (int) (before - windows.size());
     }

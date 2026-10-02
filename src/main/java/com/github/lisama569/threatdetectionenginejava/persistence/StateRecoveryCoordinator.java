@@ -236,7 +236,10 @@ public class StateRecoveryCoordinator {
 
     /**
      * 把当前内存态（已回收历史部分）原子落盘。
-     * 参考时间取 max(当前时钟, 各实体 watermark)，时钟回拨也不会多收窗口。
+     *
+     * <p>回收严格以各实体自己的 watermark 为基准，<b>不使用墙钟</b>：迟到判定本身只看
+     * watermark，与墙钟无关。这样“停机前空闲十几秒/几十秒甚至更久”时，按事件时间仍在
+     * 迟到容忍内、本来还能继续累计的窗口不会被当成过期窗口回收，重启后照常延续。</p>
      */
     public synchronized void snapshot() {
         if (!enabled) {
@@ -247,8 +250,7 @@ public class StateRecoveryCoordinator {
             log.warn("[RECOVERY] 当前为 FAILED，跳过落盘以免覆盖损坏状态");
             return;
         }
-        long referenceTime = Math.max(clock.millis(), maxWatermark());
-        int reclaimed = service.compactHistory(referenceTime);
+        int reclaimed = service.compactHistory();
 
         List<StateCodec.RuleData> ruleData = new ArrayList<>();
         for (CorrelationRule r : service.allRules()) {
@@ -293,9 +295,14 @@ public class StateRecoveryCoordinator {
         String json = codec.encode(snapshotState, nextGeneration);
         stateStore.writeAtomic(json);
         generation = nextGeneration;
-        log.warn("[RECOVERY] 状态已落盘代数={}, 本次回收固定窗口={}, 保留窗口={}, 告警={}, 去重键={}",
+        long latestWatermark = maxWatermark();
+        String idleText = latestWatermark == 0L
+                ? "N/A(尚无事件)"
+                : (clock.millis() - latestWatermark) + "ms";
+        log.warn("[RECOVERY] 状态已落盘代数={}, 本次回收固定窗口={}, 保留窗口={}, 告警={}, 去重键={},"
+                        + " 停机前距最后事件空闲={}（回收只按 watermark，空闲不多收任何容忍内窗口）",
                 generation, reclaimed, retainedWindows, alertData.size(),
-                snapshotState.dedupKeys().size());
+                snapshotState.dedupKeys().size(), idleText);
     }
 
     private long maxWatermark() {

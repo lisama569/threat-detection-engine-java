@@ -12,7 +12,7 @@
 ## 1. 快速开始
 
 ```bash
-# 构建 + 全量单测（42 个用例）
+# 构建 + 全量单测（43 个用例）
 mvn test
 
 # 启动 Web 服务（默认 8080；若端口被占用可用 --server.port 指定；本地状态默认写 ./data/state）
@@ -145,11 +145,19 @@ total = rejected + duplicate + tooLate + acceptedNoAlert + acceptedAlert
 
 ### 7.3 哪些状态会被安全回收（恢复耗时可控）
 
-停机落盘前以参考时间 `ref = max(当前时钟, 各实体 watermark)` 对每个（规则版本, 实体）执行回收：
-仅保留满足 `windowEnd > ref - lateTolerance` 的固定窗口，其余窗口丢弃。
+停机落盘前对每个（规则版本, 实体）执行回收，**回收基准严格是该实体自己的 watermark，
+与墙钟无关**：仅保留满足 `windowEnd > watermark - lateTolerance` 的固定窗口，其余窗口丢弃。
 
-- 被回收窗口里**今后可能到达的任何事件**都必然落在容忍之外（要么窗口早已关闭、要么判 TOO_LATE），
-  因此回收与不回收对后续事件的判定结论完全相同（有边界单测逐结论对照）。
+- **为什么基准只能是 watermark**：迟到判定本身只看 `watermark - eventTime`，从不看墙钟。
+  一个窗口今后还能不能收到“容忍内、可继续累计”的事件，只取决于 watermark。
+  **停机前即使长时间空闲（十几秒/几十秒甚至更久没有新事件，墙钟远超最后事件时间），
+  只要窗口仍满足 `windowEnd > watermark - lateTolerance`，就一律保留**——重启后落在其中、
+  且未超出迟到容忍的事件照常累计，窗口的计数与“是否已告警”状态不丢。
+- 被回收窗口里**今后可能到达的任何事件**都必然满足 `watermark - eventTime > lateTolerance`
+  （只能判 TOO_LATE、不参与计数），因此回收与不回收对后续事件的判定结论完全相同，
+  也不影响告警与守恒统计（有边界单测逐结论对照）。
+- 在线摄入路径在每次判定后就已经按同一基准执行过驱逐（`evict`），停机回收只是幂等的
+  兜底整理：正常情况下不会再多收窗口；它真正负责的是跨规则历史版本等在线不经过的路径。
 - **不回收**的部分：watermark（迟到基准）、投递去重键、全部告警（含历史）、规则版本。
   这些任一丢失都会改变判定（例如去重键丢失会让历史重投从 DUPLICATE 变成计数/告警）。
 - 恢复数据量只与“仍可能影响判定的近容忍窗口 + 实体数 + 去重键 + 告警量”相关，
@@ -186,6 +194,32 @@ total = rejected + duplicate + tooLate + acceptedNoAlert + acceptedAlert
 > 最近一代未落盘的事件不在状态文件中——这与“未处理”等价，上游重投即可，且因幂等键与
 > 确定性告警 ID 不会造成重复计数或重复告警。
 
+### 7.6 专题：停机前先空闲一段再重启（空闲不丢窗）
+
+**场景**：实例处理完一批事件后安静了十几秒/几十秒甚至更久（期间没有任何新事件进来），
+然后走优雅停机/滚动重启；重启后又补投一条**落在旧窗口内、按事件时间仍未超出迟到容忍**
+的事件。
+
+- **延续的状态（不会因空闲丢）**：所有满足 `windowEnd > watermark - lateTolerance`
+  的固定窗口——含窗口内去重计数、事件指纹集合、**“是否已经告警”标记**——以及各实体
+  watermark、投递去重键、全部告警与处置状态、规则版本、守恒统计。
+- **被回收的历史（与空闲无关）**：只回收 `windowEnd <= watermark - lateTolerance` 的窗口。
+  回收依据是**事件时间基准 watermark，不是停机墙钟**；空闲让墙钟前进，但 watermark 不动，
+  所以空闲本身一个窗口都不会多带走。
+- **回收之后结论为什么不变**：被回收窗口能收到的任何“未来到达”事件都必然
+  `watermark - eventTime > lateTolerance`，只能判 TOO_LATE、不参与计数，也不会新建窗口；
+  而真正影响计数/告警的容忍内事件所属窗口全部保留。因此重启后按同样顺序投同一批事件，
+  每条结论（计数、是否告警、DUPLICATE/TOO_LATE/REJECTED）以及最终告警集合、守恒统计，
+  都与“这个进程从头到尾没重启过”完全一致。
+- **停机落盘日志**会打印 `停机前距最后事件空闲=<毫秒>` 与 `本次回收固定窗口=<数量>`，
+  可直接确认“空闲很久但回收为 0、容忍内窗口全部保留”。
+- **恢复异常时的表现**（该场景与普通重启完全一致，语义不变）：
+  无状态文件 = `FRESH` 全新放行；文件损坏/校验和不符 = 默认进入 `FAILED`，一切写入返回
+  503 `RECOVERY_FAILED`、不覆盖损坏文件、读接口与失败原因仍可见（`fail-fast-on-corrupt=true`
+  时直接终止启动；`allow-fresh-on-corrupt=true` 时清空重启且恢复结论仍标记 `CORRUPT`）；
+  恢复期间（`RECOVERING`）写入一律 503 `RECOVERY_IN_PROGRESS`，不会被当空实例处理、
+  恢复后也不会重复补算。
+
 ## 8. REST 接口（本地验证）
 
 | 方法与路径 | 说明 |
@@ -219,7 +253,7 @@ curl -X POST http://localhost:8080/api/events -H 'Content-Type: application/json
 
 ## 10. 测试场景与日志
 
-`mvn test`（42 个用例）覆盖：
+`mvn test`（43 个用例）覆盖：
 
 - `NormalizationTest`：三种来源、秒/毫秒/ISO 时间戳、6 种拒绝原因逐一区分、不静默丢弃。
 - `OutOfOrderAndLateEventTest`：乱序容忍内稳定计数、恰好等于容忍边界接受、超容忍 TOO_LATE 不计数且不漏报、窗口边界不串窗、独立运行结论一致。
@@ -227,25 +261,34 @@ curl -X POST http://localhost:8080/api/events -H 'Content-Type: application/json
 - `RuleReplayTest`：同版本重放逐结论复现、v1/v2 版本隔离结论不同、在线更新不回写历史、重放不污染在线态、版本号必须递增。
 - `AlertLifecycleTest`：合法迁移链、抑制/恢复、非法跳跃、重复迁移、终态保护（from/to 可区分）。
 - `ConcurrentIngestTest`：同实体 100 事件/50 线程计数精确且告警恰好一条、10 实体并发守恒、同一投递 64 线程并发只生效一次、并发混入非法/迟到事件仍守恒。
-- `RestartRecoveryTest`（新增，重启续跑 5 个场景）：
+- `RestartRecoveryTest`（重启续跑 6 个场景）：
   - **正常重启续跑**：重启后窗口计数/去重指纹/watermark/告警处置状态延续，12 条事件逐条结论、
     告警 ID、守恒统计与“从头到尾没重启”的对照组完全一致（不多/不漏告警）；
+  - **停机前空闲一段再重启（本次新增）**：停机前空闲 100s（超过 窗口长度+迟到容忍）再优雅
+    停机，三个实体的同窗状态（2/3 未告警、2/3、3/3 已告警）全部原样恢复；重启后补投同一窗口、
+    仍在迟到容忍内的事件**接着原计数**越阈告警（不会从 1 重新开始），已告警窗口不重复告警，
+    历史投递仍判 DUPLICATE；并对“**恰好等于迟到容忍边界接受、再多 1ms 判 TOO_LATE**”做重启
+    前后对照；每条结论、最终告警 ID 集合、守恒统计都与“从头到尾没重启”的对照组逐条一致；
   - **恢复期间并发摄入**：RECOVERING 阶段 16 线程并发全部 503 拒绝、不污染计数；恢复后 30 事件
     /30 线程同实体并发告警恰好一条、统计守恒；
   - **状态缺失/损坏**：无文件=`FRESH` 放行；篡改校验和后默认 `FAILED` 拒绝写入且不覆盖现场，
     `allow-fresh-on-corrupt=true` 才清空并全新启动（结论仍标记 `CORRUPT`，可区分）；
-  - **回收后的边界事件**：恰好等于容忍接受、超 1ms 判 TOO_LATE、旧窗重投不复活、迟到不新建窗口，
-    与同样执行回收的连续运行逐结论一致；
+  - **回收后的边界事件**：只有当实体自己的 watermark 真正越过旧窗+容忍（收到远后事件）旧窗才被
+    安全回收；墙钟单独走到很久以后不会回收容忍内窗口；恰好等于容忍接受、超 1ms 判 TOO_LATE、
+    旧窗重投不复活、迟到不新建窗口，与同样执行回收的连续运行逐结论一致；
   - **规则版本切换后重启**：v1/v2 窗口与告警按版本恢复互不串，重启后事件只按在线 v2 判，
     v1 计数不被污染、不产生 v1 告警。
 
 测试日志（SLF4J）逐条打印**事件内容、判定前后窗口快照（计数/事件指纹/watermark）、判定依据**、
-**重启恢复报告（RESTORED/FRESH/CORRUPT、恢复了多少窗口/告警/去重键、回收了多少窗口、状态代数）**
-以及守恒统计，可直接看出重启前后窗口计数变化与判定依据。查看某次测试日志：
+**重启恢复报告（RESTORED/FRESH/CORRUPT、恢复了多少窗口/告警/去重键、回收了多少窗口、状态代数、
+停机前空闲时长）**以及守恒统计；另由全局测试监听器在日志中标注**每个用例的名称与
+开始/通过(PASSED)/失败(FAILED)**。可直接看出重启前后窗口计数变化与判定依据。查看某次测试日志：
 
 ```bash
 mvn test -Dtest=RestartRecoveryTest
-# 控制台或 surefire 原始输出：target/surefire-reports/*Output.txt
+# 每个测试类的完整 stdout/stderr 稳定落盘（同时也在控制台输出）：
+# target/surefire-reports/com.github.lisama569.threatdetectionenginejava.tests.persistence.RestartRecoveryTest-output.txt
+# 摘要：同目录下的 *.txt / TEST-*.xml
 ```
 
 ### 10.1 本地手动复现“滚动重启接着跑”
@@ -276,6 +319,48 @@ curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/j
 
 # 损坏状态演示：篡改文件后重启，默认进入 FAILED，摄入返回 503 RECOVERY_FAILED，
 # /api/stats 里 recovery.status=CORRUPT；加 --engine.state.allow-fresh-on-corrupt=true 可清空重启
+```
+
+### 10.2 本地手动复现“停机前空闲一段再重启，容忍内同窗事件接着累计”
+
+规则 `R-BRUTE-FORCE`：60s 窗口、阈值 3、迟到容忍 10s。下面三条事件落在同一个 60s 窗
+`[1790000000000,1790000060000)`，停机前只投前 2 条，**空等超过窗口长度+容忍后再重启**，
+第 3 条按事件时间仍在容忍内（落后 watermark 仅 2.5s），必须接着 2/3 计数越阈。
+
+```bash
+# 终端 A：启动
+mvn spring-boot:run
+
+# 终端 B：同窗投 2 条（计数 2/3，未告警），watermark=1790000002000
+for i in 1 2; do
+  curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d "{
+    \"sourceId\":\"edr\",\"deliveryId\":\"idle-$i\",
+    \"payload\":{\"hostId\":\"host-idle\",\"eventType\":\"login_failure\",
+                 \"timestamp\":$((1790000000000+i*1000)),\"severity\":\"low\"}}"; echo;
+done
+
+# 不投任何事件，安静 70 秒以上（> 窗口60s + 容忍10s），再在终端 A 优雅停机并重启
+#   停机日志关键行：本次回收固定窗口=0 ... 停机前距最后事件空闲=7xxxxms
+#   重启日志关键行：status=RESTORED ... retainedWindows=1（窗口没被空闲带走）
+mvn spring-boot:run
+
+# 重启后：第 3 条落在同窗且仍在容忍内 => 必须是 ACCEPTED_ALERT（接着 2/3 计数，而不是从 1 重来）
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "sourceId":"edr","deliveryId":"idle-3",
+  "payload":{"hostId":"host-idle","eventType":"login_failure",
+             "timestamp":1790000002500,"severity":"low"}}'; echo
+# 边界对照：watermark=...02500；落后恰好 10000ms 接受、落后 10001ms 判 TOO_LATE
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "sourceId":"edr","deliveryId":"idle-eq",
+  "payload":{"hostId":"host-idle","eventType":"login_failure",
+             "timestamp":1789999992500,"severity":"low"}}'; echo   # ACCEPTED_NO_ALERT（同窗第 4 条，已告警不重复）
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "sourceId":"edr","deliveryId":"idle-over",
+  "payload":{"hostId":"host-idle","eventType":"login_failure",
+             "timestamp":1789999992499,"severity":"low"}}'; echo   # TOO_LATE
+
+# 自动化对照（无需手等 70 秒，用可推进的固定时钟模拟空闲）：
+mvn test -Dtest='RestartRecoveryTest#idleBeforeRestartKeepsToleratedWindowsAndConclusionsMatch'
 ```
 
 ## 11. 模块结构

@@ -335,12 +335,16 @@ public class DetectionService {
     }
 
     /**
-     * 以参考时间（默认停机时刻）安全回收全部历史版本里不可能再影响判定的固定窗口。
+     * 安全回收全部历史版本里不可能再影响判定的固定窗口。
+     *
+     * <p>回收基准是每个实体各自的 watermark（与在线迟到判定同一基准，与墙钟无关）：
+     * 即使停机前长时间没有新事件，{@code windowEnd > watermark - lateTolerance}、
+     * 今后仍可能收到容忍内事件的窗口也不会被带走。</p>
      *
      * @return 被回收的窗口数
      */
-    public int compactHistory(long referenceTime) {
-        return engine.compact(referenceTime);
+    public int compactHistory() {
+        return engine.compact();
     }
 
     /** 遍历所有（规则版本, 实体）窗口态（快照用）。 */

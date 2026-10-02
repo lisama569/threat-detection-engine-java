@@ -168,11 +168,16 @@ public class CorrelationEngine {
     }
 
     /**
-     * 以参考时间对全部（规则版本, 实体）窗口态做安全回收，覆盖所有历史版本。
+     * 对全部（规则版本, 实体）窗口态做一次安全回收，覆盖所有历史版本。
+     *
+     * <p>回收基准严格采用每个实体<b>各自的 watermark</b>（迟到判定也只看 watermark），
+     * 与墙钟无关：停机前长时间空闲不会误回收容忍内窗口。只移除
+     * {@code windowEnd <= watermark - lateTolerance} 的固定窗口——其中任何未来到达的事件
+     * 都必然判 TOO_LATE，因此回收与不回收对后续判定结论完全相同。</p>
      *
      * @return 被回收的固定窗口总数
      */
-    public int compact(long referenceTime) {
+    public int compact() {
         int removed = 0;
         for (Map.Entry<String, CorrelationRule> entry : rulesByVersion.entrySet()) {
             CorrelationRule rule = entry.getValue();
@@ -181,7 +186,7 @@ public class CorrelationEngine {
                 continue;
             }
             for (WindowState state : byEntity.values()) {
-                removed += state.compactUpTo(referenceTime, rule.lateToleranceMillis());
+                removed += state.compactUpTo(state.rawWatermark(), rule.lateToleranceMillis());
             }
         }
         return removed;
