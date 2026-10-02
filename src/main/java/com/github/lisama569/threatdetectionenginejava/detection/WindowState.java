@@ -177,16 +177,38 @@ public final class WindowState {
     }
 
     /**
-     * 以外部参考时间（如停机时刻，&gt;= 本实体 watermark）做一次安全回收：
-     * 保留下来的只有“在参考时间之后仍可能收到可接受事件”的窗口——即
-     * windowEnd &gt; referenceTime - lateTolerance 的窗口；更早窗口里的任何未来事件都必然
-     * 超过迟到容忍（或窗口已关闭且不可能再计数），回收它们不改变任何后续判定结论。
+     * 以外部参考时间（如停机时刻，&gt;= 本实体 watermark）做一次安全回收。
+     *
+     * <p><b>关键：回收基准不能直接用墙钟，必须收敛到本实体的事件时间 watermark。</b>
+     * 在线判定的迟到基准是 watermark（事件时间），与墙钟无关：事件只要
+     * {@code watermark - eventTime <= lateTolerance} 就仍可接受。停机前若有一段空闲（没有
+     * 新事件进来），墙钟会持续向前走而 watermark 原地不动；如果拿墙钟算回收边界，
+     * {@code windowEnd <= wallClock - lateTolerance} 会把“按事件时间仍在迟到容忍内、本来还能
+     * 继续累计”的窗口一起带走，导致重启后计数/告警态丢失、结论与从不重启不一致。</p>
+     *
+     * <p>因此这里实际采用的回收边界基准是 {@code min(referenceTime, watermark)}：
+     * <ul>
+     *   <li>有事件推进（watermark 已到参考时间附近）时与在线 {@link #evict} 完全等价；</li>
+     *   <li>停机前空闲（墙钟领先 watermark）时退化为按 watermark 回收——即只回收
+     *       {@code windowEnd <= watermark - lateTolerance} 的窗口。这类窗口里的任何未来事件
+     *       在连续运行的进程里也必判 TOO_LATE，所以回收它们不改变任何后续判定结论；</li>
+     *   <li>watermark 未推进（从未见过事件）时什么都不回收。</li>
+     * </ul>
+     * 这样“回收”与“不回收（连续运行进程空闲时根本不触发回收）”对后续事件的判定完全一致。</p>
      *
      * @return 被回收的固定窗口数
      */
     public int compactUpTo(long referenceTime, long lateTolerance) {
+        if (lateTolerance < 0) {
+            throw new IllegalArgumentException("lateTolerance 不能为负");
+        }
+        if (watermark == Long.MIN_VALUE) {
+            return 0;
+        }
         long before = windows.size();
-        long boundary = referenceTime - lateTolerance;
+        // 只按事件时间 watermark 决定生死：墙钟只允许更保守（更小），不允许在空闲时多收窗口。
+        long safeReference = Math.min(referenceTime, watermark);
+        long boundary = safeReference - lateTolerance;
         windows.entrySet().removeIf(e -> e.getKey() + windowMillis <= boundary);
         return (int) (before - windows.size());
     }

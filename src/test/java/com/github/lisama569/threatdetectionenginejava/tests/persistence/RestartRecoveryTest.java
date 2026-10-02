@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Path;
 import java.util.List;
 
+import com.github.lisama569.threatdetectionenginejava.tests.support.EngineTestFixtures;
 import static com.github.lisama569.threatdetectionenginejava.tests.support.EngineTestFixtures.MutableClock;
 import static com.github.lisama569.threatdetectionenginejava.tests.support.EngineTestFixtures.RestartableHarness;
 import static com.github.lisama569.threatdetectionenginejava.tests.support.EngineTestFixtures.edr;
@@ -286,6 +287,116 @@ class RestartRecoveryTest {
     }
 
     @Test
+    @DisplayName("停机前空闲一段再重启：仍在迟到容忍内的窗口计数/告警态必须延续，逐条结论与从不重启一致")
+    void idleGapBeforeRestartKeepsWindowsWithinLateTolerance() {
+        MutableClock clock = fixedClock();
+        long base = clock.millis(); // 已对齐 60s 窗口
+        RestartableHarness h = new RestartableHarness(tempDir.resolve("idle"), clock);
+        h.seedRuleIfFresh(rule(1, WINDOW, THRESHOLD, TOLERANCE));
+        DetectionService svc = h.service;
+
+        // host-A：第一窗 [base, base+60s) 计数 2/3，未告警；事件靠近窗口尾部，模拟“最后一批事件后安静下来”
+        RawEvent a1 = edr("i-a-1", "host-A", base + 57_000);
+        RawEvent a2 = edr("i-a-2", "host-A", base + 58_000);
+        // host-B：第一窗计数已到 3，已告警（验证“是否已告警”状态也必须延续）
+        RawEvent b1 = edr("i-b-1", "host-B", base + 57_000);
+        RawEvent b2 = edr("i-b-2", "host-B", base + 58_000);
+        RawEvent b3 = edr("i-b-3", "host-B", base + 59_000);
+
+        List<IngestResult> pre = svc.ingestBatch(List.of(a1, a2, b1, b2, b3));
+        assertEquals(IngestOutcome.ACCEPTED_NO_ALERT, pre.get(0).outcome());
+        assertEquals(IngestOutcome.ACCEPTED_NO_ALERT, pre.get(1).outcome());
+        assertEquals(IngestOutcome.ACCEPTED_ALERT, pre.get(4).outcome(),
+                "host-B 第 3 条越阈告警");
+        String bAlertId = pre.get(4).alertId();
+        logWindows("停机前（空闲前）-窗口", svc);
+
+        // ---- 停机前安静 12s 没有任何新事件 ----
+        // watermark 停在 base+58s/base+59s（窗内），窗末 base+60s；
+        // 旧实现拿墙钟 base+71s 减容忍 = base+61s >= 窗末，把仍可接受迟到事件的第一窗误删；
+        // 连续运行的进程空闲时根本不触发回收，窗口本应原样保留。
+        clock.setMillis(base + 71_000);
+
+        RecoveryReport report = h.restart();
+        log.info("===== 空闲后重启完成：report={} =====", report);
+        assertEquals("RESTORED", report.status());
+
+        List<Long> retainedStarts = h.service.debugWindows().stream()
+                .map(w -> w.windowStart()).sorted().toList();
+        log.info("空闲后重启保留的窗口起点: {}", retainedStarts);
+        org.junit.jupiter.api.Assertions.assertTrue(retainedStarts.contains(base),
+                "空闲再重启后，按事件时间仍在迟到容忍内的第一窗不能被当成过期窗口丢掉");
+
+        var aState = h.service.findWindowStateForTest("R-BRUTE-FORCE", 1, "host-A").orElseThrow();
+        h.service.findWindowStateForTest("R-BRUTE-FORCE", 1, "host-B").orElseThrow();
+        assertEquals(base + 58_000, aState.getWatermark(), "watermark（迟到基准）必须延续");
+        // 重启后补投前先把两实体窗口态打印出来，日志可直接看到计数延续
+        logWindows("重启后、补投前-窗口（host-A 应仍为 2/3 未告警；host-B 应仍为 3/3 已告警）",
+                h.service);
+
+        // ---- 重启后逐条补投：边界对照 + 同窗补一条凑阈值 ----
+        // 重启后 host-A watermark=base+58s：
+        // 1) 恰好等于迟到容忍边界（落后正好 10000ms）=> 接受（落在同一个 60s 窗，成为第 3 个去重事件 => 越阈告警）
+        RawEvent aEq = edr("i-a-eq-tol", "host-A", base + 58_000 - TOLERANCE);
+        // 2) 再多超 1ms => 必须判 TOO_LATE，且不推进 watermark
+        RawEvent aOver = edr("i-a-over-tol-1ms", "host-A", base + 58_000 - TOLERANCE - 1);
+        // 3) 边界事件已凑够阈值后，再投同窗事件 => 接受但不能重复告警
+        RawEvent a3 = edr("i-a-3", "host-A", base + 58_500);
+        // host-B：已告警窗口再补一条同窗事件 => 接受但绝不能重复告警，统计也不能多记告警
+        RawEvent b4 = edr("i-b-4", "host-B", base + 59_500);
+
+        List<RawEvent> postBatch = List.of(aEq, aOver, a3, b4);
+        List<IngestResult> post = h.service.ingestBatch(postBatch);
+        EngineTestFixtures.logBatch("空闲重启后补投", postBatch, post);
+        assertEquals(IngestOutcome.ACCEPTED_ALERT, post.get(0).outcome(),
+                "恰好等于迟到容忍边界必须接受（重启前后一致），且接续停机前计数 2->3 越阈告警");
+        assertEquals(IngestOutcome.TOO_LATE, post.get(1).outcome(),
+                "超出容忍 1ms 必须判迟到（重启前后一致）");
+        assertEquals(IngestOutcome.ACCEPTED_NO_ALERT, post.get(2).outcome(),
+                "已告警窗口内再投事件不能重复告警");
+        assertEquals(IngestOutcome.ACCEPTED_NO_ALERT, post.get(3).outcome(),
+                "host-B 已告警窗口重启后续投不能重复告警");
+        logWindows("重启后补投后-窗口", h.service);
+        logStats(h.service);
+
+        // 告警集合：host-B 停机前的告警 + host-A 重启后凑够阈值的告警，各一条，不多不少
+        List<String> resumedAlerts = h.service.listAlerts().stream()
+                .map(Alert::getAlertId).sorted().toList();
+        log.info("空闲重启实例最终告警集合: {}", resumedAlerts);
+        assertEquals(2, resumedAlerts.size(), "不多告警也不漏告警");
+        org.junit.jupiter.api.Assertions.assertTrue(resumedAlerts.contains(bAlertId),
+                "停机前已产生的告警必须延续，不能因重启再产生一条");
+        org.junit.jupiter.api.Assertions.assertTrue(resumedAlerts.contains(post.get(0).alertId()),
+                "重启后接续计数越阈（恰在容忍边界那条成为第 3 个去重事件）必须产生告警");
+        org.junit.jupiter.api.Assertions.assertNotEquals(bAlertId, post.get(0).alertId(),
+                "host-A 的新告警与 host-B 停机前的告警是两条不同告警");
+
+        // ---- 对照组：进程从头到尾不重启，时钟同样空闲推进，按同样顺序投同一批事件 ----
+        MutableClock controlClock = fixedClock();
+        DetectionService control = newService(h.registry, controlClock);
+        control.deployRule(rule(1, WINDOW, THRESHOLD, TOLERANCE));
+        List<IngestResult> cPre = control.ingestBatch(List.of(a1, a2, b1, b2, b3));
+        controlClock.setMillis(base + 58_000); // 同样空闲，但不重启、不回收
+        List<IngestResult> cPost = control.ingestBatch(postBatch);
+        EngineTestFixtures.logBatch("对照组（从不重启）空闲后补投", postBatch, cPost);
+
+        List<IngestResult> resumedAll = concatResults(pre, post);
+        List<IngestResult> controlAll = concatResults(cPre, cPost);
+        for (int i = 0; i < controlAll.size(); i++) {
+            assertEquals(controlAll.get(i).outcome(), resumedAll.get(i).outcome(),
+                    "第 " + (i + 1) + " 条事件结论（计数/告警/重复/迟到/拒绝）必须与从不重启一致");
+            assertEquals(controlAll.get(i).alertId(), resumedAll.get(i).alertId(),
+                    "第 " + (i + 1) + " 条事件的告警 ID 必须与从不重启一致");
+        }
+        assertEquals(control.stats(), h.service.stats(),
+                "守恒统计必须完全一致：不能多记一条告警，也不能漏记");
+        assertEquals(control.rejectionBreakdown(), h.service.rejectionBreakdown());
+        List<String> controlAlerts = control.listAlerts().stream()
+                .map(Alert::getAlertId).sorted().toList();
+        assertEquals(controlAlerts, resumedAlerts, "最终告警集合必须与从不重启一致");
+    }
+
+    @Test
     @DisplayName("状态回收后的边界事件：恰好等于容忍/窗口边界的判定在重启前后不改变")
     void boundaryEventsAfterCompactionUnchanged() {
         MutableClock clock = fixedClock();
@@ -305,19 +416,28 @@ class RestartRecoveryTest {
         // 推进“当前时间”到很久以后（远超旧窗+容忍），停机时旧窗会被安全回收
         long now = aligned + 600_000L;
         clock.setMillis(now);
-        // 当前存活窗放 2 条（计数 2/3，watermark=now+1s），停机后该窗存活
+        // host-A 自身也有“更新的事件时间”推进 watermark：只有这样旧窗才真正越过
+        // watermark - 容忍 的安全线（连续运行的进程也是靠事件推进 watermark 才驱逐旧窗，
+        // 单纯墙钟流逝/空闲不能成为回收依据）。放 2 条到“当前窗”（计数 2/3，不告警）。
+        svc.ingest(edr("b-a-now-1", "host-A", now));
+        svc.ingest(edr("b-a-now-2", "host-A", now + 1_000));
+        // host-B 当前存活窗放 2 条（计数 2/3，watermark=now+1s），停机后该窗存活
         svc.ingest(edr("b-now-1", "host-B", now));
         svc.ingest(edr("b-now-2", "host-B", now + 1_000));
 
         h.stop();
         RecoveryReport report = h.restart();
         log.info("回收后重启报告: {}", report);
-        // host-A 的旧窗（aligned）已被回收；host-B 当前窗保留
+        // host-A 的旧窗（aligned）已按事件时间安全回收；host-A/host-B 当前窗保留
         List<Long> retainedStarts = h.service.debugWindows().stream()
                 .map(w -> w.windowStart()).sorted().toList();
         log.info("重启后保留的窗口起点: {}", retainedStarts);
         org.junit.jupiter.api.Assertions.assertFalse(retainedStarts.contains(aligned),
-                "早已结束且超过容忍的旧窗必须被安全回收");
+                "watermark 已远超窗末+容忍：真正不可能再影响判定的旧窗必须被安全回收");
+        // 空闲安全保障：当前窗（now 所在窗，仍在迟到容忍内）即使经历空闲也不能被回收带走
+        long currentStart = Math.floorDiv(now, WINDOW) * WINDOW;
+        org.junit.jupiter.api.Assertions.assertTrue(retainedStarts.contains(currentStart),
+                "仍在迟到容忍内的当前窗不能因停机回收被带走");
 
         // 边界事件 1：恰好等于容忍边界（watermark-eventTime == 10s）=> 与连续运行一致，接受
         IngestResult atBoundary = h.service.ingest(edr("b-eq-tol", "host-B", now + 1_000 - TOLERANCE));
@@ -356,9 +476,11 @@ class RestartRecoveryTest {
         control.ingest(edr("b-old-2", "host-A", aligned + 2_000));
         control.ingest(edr("b-old-3", "host-A", aligned + 3_000));
         controlClock.setMillis(now);
+        control.ingest(edr("b-a-now-1", "host-A", now));
+        control.ingest(edr("b-a-now-2", "host-A", now + 1_000));
         control.ingest(edr("b-now-1", "host-B", now));
         control.ingest(edr("b-now-2", "host-B", now + 1_000));
-        control.compactHistory(now); // 连续运行也做同样的回收
+        control.compactHistory(now); // 连续运行也做同样的回收（按 watermark，结论与不回收一致）
         // 对照组喂同样的“回收后边界事件”
         IngestResult cAt = control.ingest(edr("b-eq-tol", "host-B", now + 1_000 - TOLERANCE));
         IngestResult cOver = control.ingest(edr("b-over-tol", "host-B", now + 1_000 - TOLERANCE - 1));
@@ -376,6 +498,70 @@ class RestartRecoveryTest {
         // 核心守恒：恢复实例最终 acceptedAlert=2（旧窗 1 + 当前窗 1），不多不少
         assertEquals(2, h.service.stats().acceptedAlert(), "回收不能改变告警数量");
         assertEquals(2, h.service.listAlerts().size());
+    }
+
+    @Test
+    @DisplayName("停机回收只按 watermark：真正越过 watermark-容忍 的历史窗回收，空闲窗保留，回收不改变结论")
+    void shutdownCompactionReclaimsOnlyWatermarkDeadWindows() {
+        MutableClock clock = fixedClock();
+        long base = clock.millis();
+        RestartableHarness h = new RestartableHarness(tempDir.resolve("compact-direct"), clock);
+        h.seedRuleIfFresh(rule(1, WINDOW, THRESHOLD, TOLERANCE));
+        DetectionService svc = h.service;
+
+        // host-A：旧窗 [base,base+60s) 计数 1
+        svc.ingest(edr("d-old", "host-A", base + 1_000));
+        // host-A：新事件时间 = base+75s => watermark=base+75s，旧窗 end=base+60s <= 75-10=65s
+        // 在线 accept 内部会即时 evict，旧窗当场就没了（这是连续运行的正常行为）。
+        svc.ingest(edr("d-new", "host-A", base + 75_000));
+        // host-B：事件在 base+58s，然后空闲；其窗 [base,base+60s) 相对 watermark 仍在容忍内
+        svc.ingest(edr("d-b-1", "host-B", base + 58_000));
+
+        // 手工把 host-A 的“已死窗口”放回状态（模拟从未触发在线 evict 的历史积累，
+        // 例如旧版本窗口、或只做停机回收的实现），验证停机 compact 会按 watermark 安全回收它；
+        // 而 host-B 的空闲存活窗即使墙钟领先也必须保留。
+        var deadState = com.github.lisama569.threatdetectionenginejava.detection.WindowState.restore(
+                "R-BRUTE-FORCE", 1, "host-A", WINDOW, base + 75_000,
+                java.util.List.of(new com.github.lisama569.threatdetectionenginejava.detection.WindowState
+                        .PersistedWindow(base, java.util.List.of("dead-fp"), false)));
+        svc.restoreWindowStates("R-BRUTE-FORCE", 1, java.util.List.of(deadState));
+        org.junit.jupiter.api.Assertions.assertTrue(svc.debugWindows().stream()
+                .anyMatch(w -> w.entityId().equals("host-A") && w.windowStart() == base),
+                "前置：已死旧窗当前仍在内存里，等待停机回收");
+
+        // 墙钟空闲推进到 base+200s（远超一切窗口），停机回收
+        clock.setMillis(base + 200_000);
+        int reclaimed = svc.compactHistory(clock.millis());
+        log.info("停机回收窗口数={}（应只回收 host-A 的已死窗，host-B 空闲存活窗保留）", reclaimed);
+        assertEquals(1, reclaimed, "只有真正越过 watermark-容忍 的历史窗被回收");
+
+        List<WindowSnapshotForLog> survivors = svc.debugWindows().stream()
+                .map(w -> new WindowSnapshotForLog(w.entityId(), w.windowStart(), w.count(),
+                        w.alerted(), w.watermark()))
+                .toList();
+        log.info("回收后存活窗口: {}", survivors);
+        org.junit.jupiter.api.Assertions.assertFalse(svc.debugWindows().stream()
+                        .anyMatch(w -> w.entityId().equals("host-A") && w.windowStart() == base),
+                "host-A 已死旧窗必须回收");
+        org.junit.jupiter.api.Assertions.assertTrue(svc.debugWindows().stream()
+                        .anyMatch(w -> w.entityId().equals("host-B") && w.windowStart() == base),
+                "host-B 空闲存活窗（watermark=base+58s，窗内事件仍可能到达）不能因墙钟被回收");
+
+        // 回收后判定不变：host-B 补一条仍在容忍内的同窗事件（watermark-eventTime=9s）
+        IngestResult accepted = svc.ingest(edr("d-b-2", "host-B", base + 49_000));
+        assertEquals(IngestOutcome.ACCEPTED_NO_ALERT, accepted.outcome(),
+                "空闲存活窗回收后仍正常计数，结论与不回收一致");
+        // host-A 回投死窗里的旧指纹 => 因死窗已回收且 watermark 远超，先看投递层去重/再判迟到
+        IngestResult tooLate = svc.ingest(edr("d-a-ghost", "host-A", base + 2_000));
+        assertEquals(IngestOutcome.TOO_LATE, tooLate.outcome(),
+                "已回收死窗里的历史事件时间落后 watermark 超容忍，只能 TOO_LATE，不复活窗口");
+        org.junit.jupiter.api.Assertions.assertFalse(svc.debugWindows().stream()
+                .anyMatch(w -> w.entityId().equals("host-A") && w.windowStart() == base),
+                "迟到事件不得复活已回收窗口");
+    }
+
+    private record WindowSnapshotForLog(String entityId, long windowStart, long count,
+                                        boolean alerted, long watermark) {
     }
 
     @Test

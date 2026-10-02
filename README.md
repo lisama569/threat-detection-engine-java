@@ -145,15 +145,48 @@ total = rejected + duplicate + tooLate + acceptedNoAlert + acceptedAlert
 
 ### 7.3 哪些状态会被安全回收（恢复耗时可控）
 
-停机落盘前以参考时间 `ref = max(当前时钟, 各实体 watermark)` 对每个（规则版本, 实体）执行回收：
-仅保留满足 `windowEnd > ref - lateTolerance` 的固定窗口，其余窗口丢弃。
+停机落盘前会执行一次回收，但**回收的生死线只看各实体自己的事件时间 watermark，不看墙钟**：
 
-- 被回收窗口里**今后可能到达的任何事件**都必然落在容忍之外（要么窗口早已关闭、要么判 TOO_LATE），
-  因此回收与不回收对后续事件的判定结论完全相同（有边界单测逐结论对照）。
+- 传入的参考时间 `ref = max(当前时钟, 各实体 watermark)` 只是一个“墙钟上界”；
+- 对每个（规则版本, 实体）实际采用的回收基准是 `safeRef = min(ref, 该实体 watermark)`，
+  仅丢弃满足 `windowEnd <= safeRef - lateTolerance` 的固定窗口。
+
+**为什么必须用 watermark 而不是墙钟**：在线判定的迟到基准是 watermark（事件时间），
+与墙钟无关——事件只要 `watermark - eventTime <= lateTolerance` 就仍可接受。停机前如果有
+一段**空闲**（十几秒、几十秒甚至更久没有新事件），墙钟会一直向前走而 watermark 原地不动；
+若拿墙钟算回收线，空闲期一过就会把“按事件时间仍在迟到容忍内、本来还能继续累计”的窗口
+连同其计数和“已告警”标记一起带走。重启后再投一条同窗且仍在容忍内的事件，就只能从 1
+重新计数，本该越阈的告警漏掉或被推迟；反过来也可能出现守恒统计多记了一条告警、告警列表
+里却没有对应告警。回收线收敛到 watermark 后：
+
+- 有事件持续推进时（watermark 已贴近墙钟），回收与在线驱逐完全等价：
+  `windowEnd <= watermark - lateTolerance`；
+- 停机前空闲（墙钟领先 watermark）时，空闲的这段时间**不产生任何额外回收**——与
+  “从头到尾不重启、空闲时根本不触发回收”的进程行为完全一致，窗口计数/去重指纹/
+  watermark/是否已告警全部原样延续；
+- watermark 从未推进（没见过事件）的实体什么都不回收。
+
+**回收依据与“回收后结论为什么不变”**：被回收的窗口满足
+`windowEnd <= watermark - lateTolerance`，其中今后可能到达的任何事件都必然
+`watermark - eventTime >= lateTolerance`（窗口内 `eventTime >= windowStart`，而
+`windowEnd = windowStart + windowMillis`），在连续运行、从不回收的进程里也同样必判
+TOO_LATE、同样不会创建/复活窗口，因此**回收与不回收对后续每一条事件的判定结论、告警集合
+与守恒统计完全一致**（有逐结论对照的单测）。
+
 - **不回收**的部分：watermark（迟到基准）、投递去重键、全部告警（含历史）、规则版本。
   这些任一丢失都会改变判定（例如去重键丢失会让历史重投从 DUPLICATE 变成计数/告警）。
 - 恢复数据量只与“仍可能影响判定的近容忍窗口 + 实体数 + 去重键 + 告警量”相关，
   不会随全部历史窗口无限增长。
+
+### 7.3.1 “停机前空闲再重启”场景下的状态延续小结
+
+| 状态 | 空闲后重启是否延续 | 依据 |
+| --- | --- | --- |
+| 仍在迟到容忍内的窗口（计数/去重指纹/已告警标记） | 延续 | 回收线按 watermark，空闲不推进 watermark，窗口不满足回收条件 |
+| watermark（迟到基准） | 延续（单独落盘，即使窗口全被回收也不丢） | 迟到判定不回退 |
+| 真正越过 `watermark - lateTolerance` 的历史窗口 | 回收 | 其中任何未来事件在不重启进程里也必判 TOO_LATE，回收不改变结论 |
+| 投递去重键 / 告警（含处置态）/ 规则版本 / 守恒统计 | 全部延续 | 不参与按时间回收 |
+| 恢复失败（CORRUPT/FAILED） | 不覆盖现场 | FAILED 在线拒绝一切写入（503），读接口仍可查；`allow-fresh-on-corrupt=true` 才可清空重启 |
 
 ### 7.4 恢复边界与并发
 
@@ -219,7 +252,7 @@ curl -X POST http://localhost:8080/api/events -H 'Content-Type: application/json
 
 ## 10. 测试场景与日志
 
-`mvn test`（42 个用例）覆盖：
+`mvn test`（44 个用例）覆盖：
 
 - `NormalizationTest`：三种来源、秒/毫秒/ISO 时间戳、6 种拒绝原因逐一区分、不静默丢弃。
 - `OutOfOrderAndLateEventTest`：乱序容忍内稳定计数、恰好等于容忍边界接受、超容忍 TOO_LATE 不计数且不漏报、窗口边界不串窗、独立运行结论一致。
@@ -227,15 +260,24 @@ curl -X POST http://localhost:8080/api/events -H 'Content-Type: application/json
 - `RuleReplayTest`：同版本重放逐结论复现、v1/v2 版本隔离结论不同、在线更新不回写历史、重放不污染在线态、版本号必须递增。
 - `AlertLifecycleTest`：合法迁移链、抑制/恢复、非法跳跃、重复迁移、终态保护（from/to 可区分）。
 - `ConcurrentIngestTest`：同实体 100 事件/50 线程计数精确且告警恰好一条、10 实体并发守恒、同一投递 64 线程并发只生效一次、并发混入非法/迟到事件仍守恒。
-- `RestartRecoveryTest`（新增，重启续跑 5 个场景）：
+- `RestartRecoveryTest`（重启续跑 7 个场景）：
   - **正常重启续跑**：重启后窗口计数/去重指纹/watermark/告警处置状态延续，12 条事件逐条结论、
     告警 ID、守恒统计与“从头到尾没重启”的对照组完全一致（不多/不漏告警）；
+  - **停机前空闲一段再重启**（重点回归）：最后一批事件靠近窗尾，安静 12s（远超
+    窗口-容忍）后优雅停机/重启，仍在迟到容忍内的窗口计数与“已告警”状态必须延续；重启后
+    对“恰好等于容忍边界接受、超 1ms 判 TOO_LATE”做重启前后对照，边界事件接续计数
+    2/3→3/3 正常越阈告警，已告警窗口不重复告警；逐条结论、最终告警集合、守恒统计与
+    “时钟同样空闲但从头到尾没重启”的对照组完全一致；
   - **恢复期间并发摄入**：RECOVERING 阶段 16 线程并发全部 503 拒绝、不污染计数；恢复后 30 事件
     /30 线程同实体并发告警恰好一条、统计守恒；
   - **状态缺失/损坏**：无文件=`FRESH` 放行；篡改校验和后默认 `FAILED` 拒绝写入且不覆盖现场，
     `allow-fresh-on-corrupt=true` 才清空并全新启动（结论仍标记 `CORRUPT`，可区分）；
-  - **回收后的边界事件**：恰好等于容忍接受、超 1ms 判 TOO_LATE、旧窗重投不复活、迟到不新建窗口，
+  - **回收后的边界事件**：实体自身有更新事件把 watermark 推过旧窗末+容忍后，旧窗被安全回收；
+    恰好等于容忍接受、超 1ms 判 TOO_LATE、旧窗重投不复活、迟到不新建窗口，
     与同样执行回收的连续运行逐结论一致；
+  - **停机回收只按 watermark**（`shutdownCompactionReclaimsOnlyWatermarkDeadWindows`）：墙钟空闲
+    推进到 200s 后停机，真正越过 `watermark-容忍` 的历史窗被回收（回收数=1），空闲存活窗保留；
+    回收后同窗容忍内事件照常计数、历史事件仍 TOO_LATE 不复活窗口；
   - **规则版本切换后重启**：v1/v2 窗口与告警按版本恢复互不串，重启后事件只按在线 v2 判，
     v1 计数不被污染、不产生 v1 告警。
 
@@ -276,6 +318,61 @@ curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/j
 
 # 损坏状态演示：篡改文件后重启，默认进入 FAILED，摄入返回 503 RECOVERY_FAILED，
 # /api/stats 里 recovery.status=CORRUPT；加 --engine.state.allow-fresh-on-corrupt=true 可清空重启
+```
+
+### 10.2 本地手动复现“停机前安静一段再重启，窗口照常延续”
+
+规则：窗口 60s、阈值 3、迟到容忍 10s。下面用“事件时间靠近窗尾 + 停机前等待超过
+窗口-容忍(50s)”来稳定复现（墙钟以系统当前时间为准）：
+
+```bash
+# 终端 A：启动
+mvn spring-boot:run
+
+# 终端 B：取当前墙钟对齐到 60s 窗的窗尾前 3s/2s，投 2 条（计数 2/3，未告警）
+BASE=$(( $(date +%s%3N) / 60000 * 60000 ))
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d "{
+  \"sourceId\":\"edr\",\"deliveryId\":\"idle-1\",
+  \"payload\":{\"hostId\":\"host-idle\",\"eventType\":\"login_failure\",
+               \"timestamp\":$((BASE+57000)),\"severity\":\"low\"}}"; echo
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d "{
+  \"sourceId\":\"edr\",\"deliveryId\":\"idle-2\",
+  \"payload\":{\"hostId\":\"host-idle\",\"eventType\":\"login_failure\",
+               \"timestamp\":$((BASE+58000)),\"severity\":\"low\"}}"; echo
+curl -s http://localhost:8080/api/debug/windows | python3 -m json.tool | grep -E 'count|alerted|watermark'
+
+# —— 什么都别投，安静等待 12s 以上（跨过 窗末+容忍=BASE+70s）——
+sleep 12
+
+# 终端 A：Ctrl+C 优雅停机，观察日志：
+#   [RECOVERY] 状态已落盘代数=1, 本次回收固定窗口=0, 保留窗口=1 ...
+# 修复前这里会是“本次回收固定窗口=1”（窗口被墙钟误收）
+mvn spring-boot:run   # 再启动，观察 [RECOVERY] status=RESTORED ... retainedWindows=1
+
+# 重启后补投一条落在同一窗、且恰好压在迟到容忍边界上的事件：
+# watermark=BASE+58s，eventTime=BASE+48s => 落后正好 10s（容忍边界，接受），
+# 接续 2/3 -> 3/3，应返回 ACCEPTED_ALERT（修复前窗口丢失时会从 1 重新计数，不告警）
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d "{
+  \"sourceId\":\"edr\",\"deliveryId\":\"idle-eq-tol\",
+  \"payload\":{\"hostId\":\"host-idle\",\"eventType\":\"login_failure\",
+               \"timestamp\":$((BASE+48000)),\"severity\":\"low\"}}"; echo
+
+# 再超 1ms => 必须 TOO_LATE
+curl -s -X POST http://localhost:8080/api/events -H 'Content-Type: application/json' -d "{
+  \"sourceId\":\"edr\",\"deliveryId\":\"idle-over\",
+  \"payload\":{\"hostId\":\"host-idle\",\"eventType\":\"login_failure\",
+               \"timestamp\":$((BASE+47999)),\"severity\":\"low\"}}"; echo
+
+curl -s http://localhost:8080/api/alerts   # 恰好一条告警
+curl -s http://localhost:8080/api/stats   # acceptedAlert 与告警列表一致（守恒）
+```
+
+自动化对照用例见
+`RestartRecoveryTest#idleGapBeforeRestartKeepsWindowsWithinLateTolerance`
+（重启实例 vs. 时钟同样空闲但从不重启的对照组，逐条结论/告警集合/统计全等）：
+
+```bash
+mvn test -Dtest=RestartRecoveryTest#idleGapBeforeRestartKeepsWindowsWithinLateTolerance
 ```
 
 ## 11. 模块结构

@@ -236,7 +236,10 @@ public class StateRecoveryCoordinator {
 
     /**
      * 把当前内存态（已回收历史部分）原子落盘。
-     * 参考时间取 max(当前时钟, 各实体 watermark)，时钟回拨也不会多收窗口。
+     * 参考时间取 max(当前时钟, 各实体 watermark) 作为“墙钟上界”传入；真正的回收由
+     * WindowState 按各实体自身的事件时间 watermark 收敛（min(参考时间, watermark)），
+     * 因此时钟回拨不会多收窗口，停机前空闲（墙钟领先 watermark）也不会误收仍在迟到
+     * 容忍内的窗口。
      */
     public synchronized void snapshot() {
         if (!enabled) {
